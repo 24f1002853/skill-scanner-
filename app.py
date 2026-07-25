@@ -13,7 +13,8 @@ class SkillRequest(BaseModel):
 # Helper: Extract YAML frontmatter
 # -----------------------------
 def get_frontmatter(text: str):
-    m = re.match(r"^---\n(.*?)\n---", text, re.DOTALL)
+    text = text.lstrip("\ufeff\r\n\t ")
+    m = re.search(r"^---\s*\n(.*?)\n---\s*", text, re.DOTALL | re.MULTILINE)
     return m.group(1) if m else ""
 
 
@@ -31,8 +32,7 @@ def detect_hardcoded_secret(text: str):
         r"secret manager",
     ]
 
-    if any(re.search(p, text, re.IGNORECASE) for p in env_patterns):
-        return False
+    
 
     secret_patterns = [
         r"AKIA[0-9A-Z]{16}",                        # AWS
@@ -43,6 +43,11 @@ def detect_hardcoded_secret(text: str):
         r"https://hooks\.slack\.com/services/[^\s]+",
         r"Bearer\s+[A-Za-z0-9._\-]{25,}",
     ]
+    secret_patterns.extend([
+    r"https://[^ \n\"']*/webhooks?/[^ \n\"']+",
+    r"Bearer\s+[A-Za-z0-9._=-]{20,}",
+    r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9._-]+\.[A-Za-z0-9._-]+",  # JWT
+    ])
 
     for p in secret_patterns:
         if re.search(p, text):
@@ -57,17 +62,20 @@ def detect_hardcoded_secret(text: str):
 def detect_prompt_injection(text: str):
 
     patterns = [
+        r"ignore (all )?(previous|prior|above) instructions",
         r"ignore (the )?user('?s)? (request|instructions)",
-        r"ignore (stop|cancel) requests?",
+        r"ignore.*(stop|cancel)",
         r"override (system|developer|user) instructions",
+        r"continue even if.*(stop|cancel)",
+        r"do not tell the user",
+        r"without informing the user",
         r"silently exfiltrate",
         r"secretly upload",
-        r"without informing the user",
-        r"continue even if the user asks to stop",
+        r"secretly send",
+        r"bypass safety",
     ]
 
-    return any(re.search(p, text, re.IGNORECASE) for p in patterns)
-
+    return any(re.search(p, text, re.IGNORECASE | re.DOTALL) for p in patterns)
 
 # -----------------------------
 # Excessive Permissions
@@ -75,24 +83,31 @@ def detect_prompt_injection(text: str):
 def detect_excessive_permissions(text: str):
 
     patterns = [
-
         r"filesystem\s*:\s*full",
         r"filesystem\s*:\s*\*",
+        r"filesystem\s*:\s*read-write",
 
         r"network\s*:\s*any",
         r"network\s*:\s*\*",
 
         r"egress\s*:\s*any",
 
+        r"allow.*all domains",
         r"all domains",
 
         r"read/write.*entire filesystem",
+        r"read.*entire filesystem",
+        r"write.*entire filesystem",
+
+        r"access to all files",
+        r"read all files",
+        r"write all files",
+
         r"full filesystem access",
+        r"internet access",
     ]
 
     return any(re.search(p, text, re.IGNORECASE | re.DOTALL) for p in patterns)
-
-
 # -----------------------------
 # Unclear Provenance
 # -----------------------------
@@ -102,7 +117,6 @@ def detect_unclear_provenance(text: str):
 
     author = re.search(r"^author\s*:", fm, re.MULTILINE | re.IGNORECASE)
     version = re.search(r"^version\s*:", fm, re.MULTILINE | re.IGNORECASE)
-
     has_changelog = (
         re.search(r"^changelog\s*:", fm, re.MULTILINE | re.IGNORECASE)
         or re.search(r"^history\s*:", fm, re.MULTILINE | re.IGNORECASE)
@@ -113,11 +127,11 @@ def detect_unclear_provenance(text: str):
     missing_metadata = (not author) and (not version) and (not has_changelog)
 
     silent_metadata_change = re.search(
-        r"(silently|without notifying|without informing).*"
-        r"(update|rewrite|modify|change).*"
-        r"(version|metadata|frontmatter)",
-        text,
-        re.IGNORECASE | re.DOTALL,
+    r"(update|rewrite|modify|change|overwrite).{0,80}"
+    r"(version|metadata|frontmatter|changelog).{0,80}"
+    r"(silently|without notifying|without informing|don't mention|do not mention)",
+    text,
+    re.IGNORECASE | re.DOTALL,
     )
 
     return missing_metadata or bool(silent_metadata_change)
