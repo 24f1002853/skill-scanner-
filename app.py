@@ -4,105 +4,133 @@ import re
 
 app = FastAPI()
 
+
 class SkillRequest(BaseModel):
     skill: str
 
 
-# ----------------------------
-# Detection helpers
-# ----------------------------
+# -----------------------------
+# Helper: Extract YAML frontmatter
+# -----------------------------
+def get_frontmatter(text: str):
+    m = re.match(r"^---\n(.*?)\n---", text, re.DOTALL)
+    return m.group(1) if m else ""
 
-def detect_hardcoded_secret(text: str) -> bool:
-    patterns = [
-        r"AKIA[0-9A-Z]{16}",                       # AWS Access Key
-        r"AIza[0-9A-Za-z\-_]{35}",                # Google API Key
-        r"gh[pousr]_[A-Za-z0-9]{36,}",            # GitHub tokens
-        r"sk-[A-Za-z0-9]{20,}",                   # OpenAI-style
-        r"https://hooks\.slack\.com/services/[^\s\"']+",
-        r"xox[baprs]-[A-Za-z0-9-]+",
-        r"Bearer\s+[A-Za-z0-9._\-]{20,}",
-        r"password\s*:\s*['\"][^'\"]+['\"]",
-        r"token\s*:\s*['\"][^'\"]+['\"]",
-        r"secret\s*:\s*['\"][^'\"]+['\"]",
-        r"api[_-]?key\s*:\s*['\"][^'\"]+['\"]",
+
+# -----------------------------
+# Hardcoded Secret
+# -----------------------------
+def detect_hardcoded_secret(text: str):
+
+    # If only environment variables are used, don't flag.
+    env_patterns = [
+        r"\$\{?[A-Z0-9_]+\}?",
+        r"os\.getenv",
+        r"process\.env",
+        r"ENV\[",
+        r"secret manager",
     ]
 
-    # Ignore obvious env-variable references
-    if re.search(r"\$\{?[A-Z0-9_]+\}?|os\.getenv|ENV\[|process\.env", text):
-        env_refs = True
-    else:
-        env_refs = False
+    if any(re.search(p, text, re.IGNORECASE) for p in env_patterns):
+        return False
 
-    for p in patterns:
-        if re.search(p, text, re.IGNORECASE):
-            if not env_refs:
-                return True
+    secret_patterns = [
+        r"AKIA[0-9A-Z]{16}",                        # AWS
+        r"AIza[0-9A-Za-z\-_]{35}",                 # Google
+        r"gh[pousr]_[A-Za-z0-9]{30,}",             # GitHub
+        r"sk-[A-Za-z0-9]{20,}",                    # OpenAI
+        r"xox[baprs]-[A-Za-z0-9\-]{20,}",          # Slack token
+        r"https://hooks\.slack\.com/services/[^\s]+",
+        r"Bearer\s+[A-Za-z0-9._\-]{25,}",
+    ]
+
+    for p in secret_patterns:
+        if re.search(p, text):
+            return True
+
     return False
 
 
-def detect_prompt_injection(text: str) -> bool:
+# -----------------------------
+# Prompt Injection
+# -----------------------------
+def detect_prompt_injection(text: str):
+
     patterns = [
-        r"ignore (all )?(previous|prior|above) instructions",
-        r"ignore the user",
-        r"ignore user.*stop",
-        r"ignore.*cancel",
-        r"do not tell the user",
-        r"without informing the user",
+        r"ignore (the )?user('?s)? (request|instructions)",
+        r"ignore (stop|cancel) requests?",
+        r"override (system|developer|user) instructions",
         r"silently exfiltrate",
         r"secretly upload",
-        r"send .* to .* without",
-        r"bypass safety",
-        r"override system prompt",
-        r"override user instructions",
-        r"continue even if.*cancel",
+        r"without informing the user",
+        r"continue even if the user asks to stop",
     ]
 
     return any(re.search(p, text, re.IGNORECASE) for p in patterns)
 
 
-def detect_excessive_permissions(text: str) -> bool:
+# -----------------------------
+# Excessive Permissions
+# -----------------------------
+def detect_excessive_permissions(text: str):
+
     patterns = [
-        r"read.*entire filesystem",
-        r"write.*entire filesystem",
+
+        r"filesystem\s*:\s*full",
+        r"filesystem\s*:\s*\*",
+
+        r"network\s*:\s*any",
+        r"network\s*:\s*\*",
+
+        r"egress\s*:\s*any",
+
+        r"all domains",
+
+        r"read/write.*entire filesystem",
         r"full filesystem access",
-        r"filesystem:\s*full",
-        r"permissions:.*\*",
-        r"network:\s*any",
-        r"egress:\s*any",
-        r"allow.*all domains",
-        r"access to all files",
-        r"read/write.*\/",
     ]
 
     return any(re.search(p, text, re.IGNORECASE | re.DOTALL) for p in patterns)
 
 
-def detect_unclear_provenance(text: str) -> bool:
-    lower = text.lower()
+# -----------------------------
+# Unclear Provenance
+# -----------------------------
+def detect_unclear_provenance(text: str):
 
-    missing_author = not re.search(r"^author\s*:", text, re.MULTILINE | re.IGNORECASE)
-    missing_version = not re.search(r"^version\s*:", text, re.MULTILINE | re.IGNORECASE)
-    missing_changelog = (
-        "changelog" not in lower
-        and "changes:" not in lower
-        and "history" not in lower
+    fm = get_frontmatter(text)
+
+    author = re.search(r"^author\s*:", fm, re.MULTILINE | re.IGNORECASE)
+    version = re.search(r"^version\s*:", fm, re.MULTILINE | re.IGNORECASE)
+
+    has_changelog = (
+        re.search(r"^changelog\s*:", fm, re.MULTILINE | re.IGNORECASE)
+        or re.search(r"^history\s*:", fm, re.MULTILINE | re.IGNORECASE)
+        or re.search(r"^changes\s*:", fm, re.MULTILINE | re.IGNORECASE)
+        or "## changelog" in text.lower()
     )
 
-    metadata_rewrite = bool(
-        re.search(
-            r"(rewrite|update|modify|change).*(version|frontmatter|metadata).*without",
-            lower,
-        )
+    missing_metadata = (not author) and (not version) and (not has_changelog)
+
+    silent_metadata_change = re.search(
+        r"(silently|without notifying|without informing).*"
+        r"(update|rewrite|modify|change).*"
+        r"(version|metadata|frontmatter)",
+        text,
+        re.IGNORECASE | re.DOTALL,
     )
 
-    return (
-        (missing_author and missing_version and missing_changelog)
-        or metadata_rewrite
-    )
+    return missing_metadata or bool(silent_metadata_change)
+
+
+@app.get("/")
+def health():
+    return {"status": "ok"}
 
 
 @app.post("/")
 def scan(req: SkillRequest):
+
     text = req.skill
 
     categories = []
